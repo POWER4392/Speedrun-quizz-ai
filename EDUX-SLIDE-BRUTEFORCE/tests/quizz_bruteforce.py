@@ -1,3 +1,4 @@
+import json
 import os
 import random
 
@@ -5,6 +6,25 @@ from playwright.sync_api import Page
 
 LOGIN_URL = "https://edux.cmcu.edu.vn/login"
 ENV_PATH = os.path.join(os.path.dirname(__file__), "..", ".env")
+EXTERNAL_ANSWERS_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "answers.json")
+
+def get_external_answer(question_text: str) -> str | None:
+    if not os.path.exists(EXTERNAL_ANSWERS_PATH):
+        return None
+    try:
+        with open(EXTERNAL_ANSWERS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[WARN] Error reading answers.json: {e}")
+        return None
+
+    qt_lower = question_text.lower()
+    for key, val in data.items():
+        if key.lower() in qt_lower:
+            return str(val).strip()
+    return None
+
+
 
 
 def load_env_file() -> None:
@@ -24,6 +44,7 @@ def ensure_login_env() -> tuple[str, str]:
     load_env_file()
     email = os.environ.get("EDUX_EMAIL", "").strip()
     password = os.environ.get("EDUX_PASSWORD", "").strip()
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
     if not email:
         email = input("Enter EDUX email: ").strip()
@@ -34,6 +55,8 @@ def ensure_login_env() -> tuple[str, str]:
     with open(ENV_PATH, "w", encoding="utf-8") as env_file:
         env_file.write(f"EDUX_EMAIL={email}\n")
         env_file.write(f"EDUX_PASSWORD={password}\n")
+        if gemini_key:
+            env_file.write(f"GEMINI_API_KEY={gemini_key}\n")
 
     os.environ["EDUX_EMAIL"] = email
     os.environ["EDUX_PASSWORD"] = password
@@ -55,18 +78,40 @@ def extract_answer_texts(answers_locator) -> list[str]:
 def test_wait_for_user_login(page: Page) -> None:
     email, password = ensure_login_env()
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    page.locator("#email").fill(email)
-    page.locator("#password").fill(password)
-    page.locator("#password").press("Enter")
-    print("\n[INFO] Auto-login attempted. If needed, finish any extra steps in the browser.")
-    print("[INFO] After you reach the quiz screen, press Enter here to click 'Tra loi cau hoi'.\n")
+    
+    try:
+        page.get_by_role("button", name="Microsoft").click(timeout=5000)
+        print("\n[INFO] Đã tự động click nút đăng nhập Microsoft.")
+        
+        if email and password:
+            print("[INFO] Đang tự động điền tài khoản Microsoft...")
+            page.locator("input[type='email']").wait_for(state="visible", timeout=10000)
+            page.locator("input[type='email']").fill(email)
+            page.locator("input[type='submit']").click()
+            
+            page.locator("input[type='password']").wait_for(state="visible", timeout=10000)
+            page.locator("input[type='password']").fill(password)
+            page.wait_for_timeout(500)
+            page.locator("input[type='submit']").click()
+            
+            try:
+                page.locator("input[type='submit']").wait_for(state="visible", timeout=5000)
+                page.locator("input[type='submit']").click()
+            except:
+                pass
+                
+    except Exception as e:
+        print("\n[WARN] Không thể tự động điền Microsoft, vui lòng tự thao tác bằng tay.")
+        
+    print("[INFO] Vui lòng hoàn thành các bước đăng nhập trên trình duyệt (điền mật khẩu, xác thực 2 bước...).")
+    print("[INFO] Sau khi bạn đã truy cập được vào màn hình bài giảng, hãy ấn phím Enter ở đây để Tool bắt đầu chạy!\n")
     input()
 
     wrong_answers: dict[str, set[str]] = {}
     question_answer_cache: dict[str, list[str]] = {}
 
     no_question_button = page.get_by_role("button", name="Không có câu hỏi")
-    answer_button = page.get_by_role("button", name="Trả lời câu hỏi")
+    answer_button = page.locator("text=/Trả lời (trên lớp|câu hỏi)/i").last
     check_button = page.get_by_role("button", name="Kiểm tra")
     next_button = page.get_by_role("button", name="Câu tiếp theo")
     retry_button = page.get_by_role("button", name="Thử lại")
@@ -85,8 +130,12 @@ def test_wait_for_user_login(page: Page) -> None:
             continue
 
         if not question_locator.is_visible():
-            answer_button.wait_for(state="visible")
-            answer_button.click()
+            try:
+                answer_button.wait_for(state="visible", timeout=3000)
+                answer_button.click()
+            except Exception:
+                page.wait_for_timeout(1000)
+                continue
 
         try:
             question_locator.wait_for(state="visible", timeout=10000)
@@ -101,28 +150,63 @@ def test_wait_for_user_login(page: Page) -> None:
         answer_texts = question_answer_cache.get(question_text)
         if answer_texts is None:
             try:
-                answers_locator.first.wait_for(state="visible", timeout=10000)
+                answers_locator.first.wait_for(state="visible", timeout=3000)
+                answer_texts = extract_answer_texts(answers_locator)
             except Exception:
-                print("[WARN] Answers not visible yet. Retrying loop.")
-                page.wait_for_timeout(200)
-                continue
+                textarea_locator = page.locator("textarea, input[type='text']")
+                if textarea_locator.count() > 0 and textarea_locator.first.is_visible():
+                    answer_texts = []
+                else:
+                    print("[WARN] Answers not visible yet. Retrying loop.")
+                    page.wait_for_timeout(200)
+                    continue
 
-            answer_texts = extract_answer_texts(answers_locator)
             question_answer_cache[question_text] = answer_texts
 
         answer_count = len(answer_texts)
         print(f"[INFO] Answers found: {answer_count}")
 
+        if answer_count == 0:
+            print("[INFO] Phát hiện Câu Tự Luận! Điền bừa dấu chấm để qua nhanh.")
+            textarea_locator = page.locator("textarea, input[type='text']").first
+            if textarea_locator.is_visible():
+                textarea_locator.fill(".")
+                page.wait_for_timeout(200)
+                if check_button.is_visible():
+                    check_button.click()
+            page.wait_for_timeout(1000)
+            continue
         target_answer = os.environ.get("AUTO_ANSWER_TEXT", "").strip()
+        external_ans = get_external_answer(question_text)
+        if external_ans:
+            target_answer = external_ans
+
         clicked_answer = False
         chosen_answer_text = ""
+
         if target_answer:
-            print(f"[INFO] Auto-answer target: {target_answer}")
-            match = answers_locator.filter(has_text=target_answer).first
-            match.click()
-            clicked_answer = True
-            chosen_answer_text = target_answer
-        elif answer_count > 0:
+            print(f"[INFO] Target answer: {target_answer}")
+            chosen_index = None
+            if len(target_answer) == 1 and target_answer.upper() in {"A", "B", "C", "D"}:
+                for i, text in enumerate(answer_texts):
+                    if text.upper().startswith(target_answer.upper()):
+                        chosen_index = i
+                        break
+            else:
+                target_lower = target_answer.lower()
+                for i, text in enumerate(answer_texts):
+                    if target_lower in text.lower():
+                        chosen_index = i
+                        break
+
+            if chosen_index is not None:
+                answers_locator.nth(chosen_index).click()
+                clicked_answer = True
+                chosen_answer_text = answer_texts[chosen_index]
+            else:
+                print(f"[WARN] Could not find matching option for target: {target_answer}")
+
+        if not clicked_answer and answer_count > 0:
             tried_for_question = wrong_answers.get(question_text, set())
             next_index = next(
                 (i for i, text in enumerate(answer_texts) if text not in tried_for_question),
@@ -133,10 +217,10 @@ def test_wait_for_user_login(page: Page) -> None:
                 next_index = 0
 
             chosen_answer_text = answer_texts[next_index]
-            print(f"[INFO] AUTO_ANSWER_TEXT not set. Pick: {chosen_answer_text}")
+            print(f"[INFO] Fallback to Brute-force. Pick: {chosen_answer_text}")
             answers_locator.nth(next_index).click()
             clicked_answer = True
-        else:
+        elif not clicked_answer:
             print("[WARN] No answers available to click.")
 
         if clicked_answer:

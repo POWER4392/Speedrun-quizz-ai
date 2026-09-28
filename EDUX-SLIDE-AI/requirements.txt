@@ -1,8 +1,0 @@
-pyautogui
-easyocr
-ollama
-opencv-python
-pillow
-keyboard
-fuzzywuzzy
-python-Levenshtein
