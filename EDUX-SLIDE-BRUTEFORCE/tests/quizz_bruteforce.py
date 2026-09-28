@@ -225,7 +225,6 @@ def test_wait_for_user_login(page: Page) -> None:
 
         if clicked_answer:
             check_button.click()
-            print("[INFO] Clicked 'Kiem tra' button.")
 
             try:
                 page.wait_for_function(
@@ -239,27 +238,26 @@ def test_wait_for_user_login(page: Page) -> None:
                       });
                     }
                     """,
-                    timeout=10000,
+                    timeout=1200,
                 )
 
                 if next_page_button.is_visible():
                     next_page_button.click()
-                    print("[INFO] Clicked 'Trang sau' button.")
+                    print("[INFO] Đúng! Clicked 'Trang sau'.")
                 elif next_button.is_visible():
                     next_button.click()
-                    print("[INFO] Clicked 'Cau tiep theo' button.")
+                    print("[INFO] Đúng! Clicked 'Cau tiep theo'.")
                 elif retry_button.is_visible():
                     retry_button.click()
                     if chosen_answer_text:
                         wrong_answers.setdefault(question_text, set()).add(chosen_answer_text)
                         print(f"[INFO] Marked wrong answer: {chosen_answer_text}")
-                    print("[INFO] Clicked 'Thu lai' button.")
                 else:
-                    print("[WARN] Follow-up buttons not visible after wait.")
+                    pass
             except Exception:
-                print("[WARN] No follow-up button appeared.")
+                pass
 
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(25)
 
     # Keep this test non-failing while we are still wiring selectors.
     print(f"[INFO] Current URL after click: {page.url}")

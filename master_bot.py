@@ -365,148 +365,200 @@ def extract_test_options(options_locator) -> list[dict]:
 
 
 def handle_slide(page: Page) -> None:
-    """Xử lý toàn bộ phần bài giảng (slide)."""
+    """Xử lý siêu tốc phần bài giảng (slide) với mục tiêu 100+ câu/phút."""
     global slide_last_clicked_text
 
-    btn_no_q    = page.locator("text='Không có câu hỏi'").last
-    btn_ans_q   = page.locator("text=/Trả lời (trên lớp|câu hỏi)/i").last
-    btn_check   = page.locator("text='Kiểm tra'").last
-    btn_next_pg = page.locator("text='Trang sau'").last
-    btn_next_q  = page.locator("text='Câu tiếp theo'").last
-    btn_retry   = page.locator("text='Thử lại'").last
-    btn_change  = page.locator("text='Đổi câu hỏi'").last
+    # 1. Kiểm tra nhanh dialog đang mở
+    btn_change = page.locator("text='Đổi câu hỏi'").last
+    btn_check  = page.locator("text='Kiểm tra'").last
 
-    # --- 1. Dialog đang mở ---
-    if btn_change.is_visible():
-
-        # 1a. Đúng rồi → sang câu tiếp hoặc trang sau
-        btn_next = btn_next_q if btn_next_q.is_visible() else btn_next_pg
-        if btn_next.is_visible() and not btn_check.is_visible() and not btn_retry.is_visible():
-            print("[SLIDE] Đúng! Click nút chuyển tiếp.")
-            slide_last_clicked_text = ""
-            btn_next.click(force=True)
-            page.wait_for_timeout(200)
-            return
-
-        # 1b. Sai → ghi nhận + retry
-        if btn_retry.is_visible():
-            # Đọc câu hỏi để lưu vào wrong cache
-            q_text = _read_question_text(page)
-            if slide_last_clicked_text and q_text:
-                slide_wrong_answers.setdefault(q_text, set()).add(slide_last_clicked_text)
-                slide_last_clicked_text = ""
-                print(f"[SLIDE] Sai! Ghi nhận và thử lại...")
-            btn_retry.click(force=True)
-            page.wait_for_timeout(200)
-            return
-
-        # 1c. Đang chờ chọn đáp án
-        if btn_check.is_visible():
-            q_text = _read_question_text(page)
-            wrong_set = slide_wrong_answers.setdefault(q_text, set()) if q_text else set()
-
-            # Tìm options bằng nhiều selector
-            options_loc = _find_options(page)
-
-            if options_loc is None:
-                # Câu tự luận: điền dấu chấm cho qua
-                ta = page.locator("textarea, input[type='text']").first
-                if ta.is_visible():
-                    ta.fill(".")
-                    page.wait_for_timeout(100)
-                    btn_check.click(force=True)
-                    page.wait_for_timeout(300)
-                else:
-                    print("[SLIDE] Không tìm thấy đáp án hoặc ô nhập liệu. Đang chờ...")
-                    page.wait_for_timeout(1000)
+    # Đang trong dialog trả lời
+    if btn_change.is_visible() or btn_check.is_visible():
+        start_time = time.time()
+        while time.time() - start_time < 6.0:
+            if bot_paused:
                 return
 
-            count = options_loc.count()
-            opts = []
-            for i in range(count):
+            # Kiểm tra xem có nút chuyển tiếp sẵn không (đã đúng từ trước)
+            btn_next_q  = page.locator("text='Câu tiếp theo'").last
+            btn_next_pg = page.locator("text='Trang sau'").last
+            btn_next = btn_next_q if btn_next_q.is_visible() else btn_next_pg
+            if btn_next.is_visible() and not btn_check.is_visible():
+                btn_next.click(force=True)
+                return
+
+            # Nếu nút Thử lại đang hiện sẵn
+            btn_retry = page.locator("text='Thử lại'").last
+            if btn_retry.is_visible():
+                btn_retry.click(force=True)
+
+            if btn_check.is_visible():
+                q_text = _read_question_text(page)
+                wrong_set = slide_wrong_answers.setdefault(q_text, set()) if q_text else set()
+
+                opt_info = _find_options_info(page)
+                if not opt_info or opt_info.get("count", 0) == 0:
+                    # Câu tự luận: điền nhanh dấu chấm
+                    ta = page.locator("textarea, input[type='text']").first
+                    if ta.is_visible():
+                        ta.fill(".")
+                        btn_check.click(force=True)
+                        try:
+                            page.wait_for_function(
+                                "() => Array.from(document.querySelectorAll('button')).some(b => ['Câu tiếp theo', 'Trang sau', 'Thử lại'].includes((b.textContent||'').trim()) && !b.disabled)",
+                                timeout=1200
+                            )
+                        except:
+                            pass
+                    return
+
+                count = opt_info["count"]
+                opts = opt_info["texts"]
+
+                # 1. Ưu tiên answers.json
+                chosen = -1
+                if q_text:
+                    ext = get_external_answer(q_text)
+                    if ext:
+                        ext_up = ext.strip().upper()
+                        idx = {"A": 0, "B": 1, "C": 2, "D": 3}.get(ext_up, -1)
+                        if idx != -1 and idx < count:
+                            chosen = idx
+                        else:
+                            for i, t in enumerate(opts):
+                                if ext.lower() in t.lower() and t not in wrong_set:
+                                    chosen = i
+                                    break
+
+                # 2. Brute-force: chọn đáp án chưa thử
+                if chosen == -1:
+                    for i, t in enumerate(opts):
+                        if t not in wrong_set:
+                            chosen = i
+                            break
+
+                # 3. Hết đáp án -> reset và thử lại từ đầu
+                if chosen == -1:
+                    wrong_set.clear()
+                    chosen = 0
+
+                clicked_text = opts[chosen] if chosen < len(opts) else ""
+                sel = opt_info["selector"]
+
+                # Click chọn đáp án
+                page.locator(sel).nth(chosen).click(force=True)
+                # Click kiểm tra ngay lập tức
+                btn_check.click(force=True)
+
+                # Chờ kết quả xuất hiện qua wait_for_function siêu tốc (polling ~16ms)
                 try:
-                    opts.append(options_loc.nth(i).inner_text().strip().replace("\n", " "))
+                    res = page.wait_for_function(
+                        """() => {
+                            const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+                            for (const b of btns) {
+                                const t = (b.textContent || '').trim();
+                                if ((t === 'Câu tiếp theo' || t === 'Trang sau' || t === 'Thử lại') && !b.disabled && b.offsetParent !== null) {
+                                    return t;
+                                }
+                            }
+                            return null;
+                        }""",
+                        timeout=1200
+                    )
+                    action = res.json_value()
+                    if action in ('Câu tiếp theo', 'Trang sau'):
+                        page.locator(f"text='{action}'").last.click(force=True)
+                        print(f"[SLIDE ⚡] Đúng! Đã chuyển tiếp ({action}).")
+                        return
+                    elif action == 'Thử lại':
+                        if clicked_text and q_text:
+                            wrong_set.add(clicked_text)
+                        page.locator("text='Thử lại'").last.click(force=True)
+                        # Tiếp tục vòng lặp ngay lập tức để thử phương án tiếp theo!
+                        continue
                 except:
-                    opts.append(f"opt_{i}")
+                    return
+        return
 
-            # Ưu tiên answers.json
-            chosen = -1
-            if q_text:
-                ext = get_external_answer(q_text)
-                if ext:
-                    ext_up = ext.strip().upper()
-                    idx = {"A": 0, "B": 1, "C": 2, "D": 3}.get(ext_up, -1)
-                    if idx != -1 and idx < count:
-                        chosen = idx
-                    else:
-                        for i, t in enumerate(opts):
-                            if ext.lower() in t.lower() and t not in wrong_set:
-                                chosen = i
-                                break
-
-            # Brute-force: chọn đáp án chưa sai
-            if chosen == -1:
-                for i, t in enumerate(opts):
-                    if t not in wrong_set:
-                        chosen = i
-                        print(f"[SLIDE] Brute-force: đáp án {i+1}/{count}")
-                        break
-
-            # Hết sạch → reset và thử lại từ đầu
-            if chosen == -1:
-                wrong_set.clear()
-                chosen = 0
-                print("[SLIDE] Hết đáp án, reset và thử lại.")
-
-            slide_last_clicked_text = opts[chosen] if chosen < len(opts) else ""
-            options_loc.nth(chosen).click(force=True)
-            page.wait_for_timeout(150)
-            btn_check.click(force=True)
-            page.wait_for_timeout(300)
-        return  # Đang trong dialog nhưng chưa có gì khả dụng, đợi
-
-    # --- 2. Slide không có câu hỏi ---
+    # 2. Slide không có câu hỏi -> Trang sau
+    btn_no_q    = page.locator("text='Không có câu hỏi'").last
+    btn_next_pg = page.locator("text='Trang sau'").last
     if btn_no_q.is_visible():
         if btn_next_pg.is_visible():
-            print("[SLIDE] Không có câu hỏi. Sang trang sau.")
             btn_next_pg.click(force=True)
-            page.wait_for_timeout(500)
         return
 
-    # --- 3. Chưa trả lời → click mở dialog ---
+    # 3. Nút mở câu hỏi ("Trả lời câu hỏi" / "Trả lời trên lớp")
+    btn_ans_q = page.locator("text=/Trả lời (trên lớp|câu hỏi)/i").last
     if btn_ans_q.is_visible():
-        print("[SLIDE] Click nút Trả lời...")
         btn_ans_q.click(force=True)
-        page.wait_for_timeout(600)  # chờ dialog mở
+        try:
+            page.locator("text='Kiểm tra', text='Đổi câu hỏi'").first.wait_for(state="visible", timeout=600)
+        except:
+            pass
         return
 
-    # --- 4. Không có dialog, đang xem slide thường → Trang sau ---
+    # 4. Slide thường đang xem -> Trang sau hoặc Câu tiếp theo
     if btn_next_pg.is_visible():
         btn_next_pg.click(force=True)
-        page.wait_for_timeout(200)
         return
 
+    btn_next_q = page.locator("text='Câu tiếp theo'").last
     if btn_next_q.is_visible():
         btn_next_q.click(force=True)
-        page.wait_for_timeout(200)
+        return
 
 
 def _read_question_text(page: Page) -> str:
-    """Lấy text câu hỏi hiện tại trên trang."""
-    for sel in ["p.my-3", "div.prose p", "p.text-gray-800", "h3", "p"]:
-        try:
-            loc = page.locator(sel).first
-            if loc.is_visible():
-                t = loc.inner_text().strip()
-                if len(t) > 10:
-                    return t
-        except:
-            pass
-    return ""
+    """Lấy text câu hỏi hiện tại cực nhanh qua evaluate."""
+    try:
+        return page.evaluate("""() => {
+            const selectors = ["div[role='dialog'] p.my-3", "p.my-3", "div.prose p", "p.text-gray-800", "h3", "p"];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                    const t = (el.innerText || '').trim();
+                    if (t.length > 8 && !t.includes('Đổi câu hỏi') && !t.includes('Kiểm tra') && !t.includes('Thử lại')) {
+                        return t;
+                    }
+                }
+            }
+            return "";
+        }""")
+    except:
+        return ""
+
+
+def _find_options_info(page: Page) -> dict | None:
+    """Tìm thông tin và selector đáp án trong 1 roundtrip duy nhất."""
+    try:
+        return page.evaluate("""() => {
+            const selectors = [
+                "div.relative.flex.items-center.space-x-2.p-2.border.rounded-lg.cursor-pointer",
+                "div.flex.items-center.space-x-6.p-8.rounded-xl.border-2.transition-colors.cursor-pointer",
+                "div[class*='rounded'][class*='cursor-pointer'][class*='border']",
+                "div.flex.cursor-pointer",
+                "label.cursor-pointer",
+                "div[class*='option']"
+            ];
+            for (const sel of selectors) {
+                const els = Array.from(document.querySelectorAll(sel));
+                if (els.length >= 2) {
+                    return {
+                        selector: sel,
+                        count: els.length,
+                        texts: els.map(el => (el.innerText || '').trim().replace(/\\n/g, ' '))
+                    };
+                }
+            }
+            return null;
+        }""")
+    except:
+        return None
 
 
 def _find_options(page: Page):
-    """Tìm locator các đáp án trắc nghiệm bằng nhiều selector."""
+    """Tìm locator các đáp án trắc nghiệm bằng nhiều selector (fallback)."""
     for sel in [
         "div.relative.flex.items-center.space-x-2.p-2.border.rounded-lg.cursor-pointer",
         "div.flex.items-center.space-x-6.p-8.rounded-xl.border-2.transition-colors.cursor-pointer",
@@ -820,18 +872,18 @@ def test_master_bot(page: Page) -> None:
             if is_test:
                 solve_test_full(page)
                 last_action_time = time.time()
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(300)
             elif is_slide:
                 handle_slide(page)
                 last_action_time = time.time()
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(25)
             else:
-                page.wait_for_timeout(300)
+                page.wait_for_timeout(200)
                 if time.time() - last_action_time > 30:
                     print("[INFO] Đang chờ bạn mở bài học...")
                     last_action_time = time.time()
         except Exception as e:
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(200)
 
 
 
